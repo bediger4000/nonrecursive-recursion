@@ -1,0 +1,147 @@
+*Notes from a long-ago email discussion of cpup4.c
+
+You're correct: SPARC passes function parameters in registers.
+However, it still requires stack frames for "non-leaf procedures"
+and it requires stack frames with a lot of empty space.  When 
+you compile a null routine:
+
+void nullproc(void)
+{
+	return;
+}
+
+You get something like this:
+
+  Address         Instruction       Decoded
+0x00000010        0x9de3bfa0        save %sp, -96, %sp  ! function nullproc
+0x00000014        0x10800004        ba 0x00000024
+0x00000018        0x01000000        nop
+0x0000001c        0x10800002        ba 0x00000024
+0x00000020        0x01000000        nop
+0x00000024        0x81c7e008        ret
+0x00000028        0x81e80000        restore
+
+The "save" instruction rolls the register window, and adds -96 to
+the value of %sp (%o6 by convention).  The 96 bytes gets used by
+a kernel trap handler to dump the contents of the in/out and some
+local registers when the register window is about to overflow.  A
+register window overflow trap occurs when a "save" would roll the
+register window to a set of in/out registers already in use.
+This happens when a call stack gets too deep.  Take a look at
+http://www.sics.se/~psm/sparcstack.html, the section "Register
+Windows and the Stack".  I believe you can force the kernel to
+dump the register windows to the stack with the right "trap"
+call, even in a userland program.
+
+My suspicion was wrong: a copied printf() call doesn't segfault
+because of a failure to set up a stack frame.  It's because the
+"call" instruction contains an offset to the called destination
+that's relative to the current program counter (pc).
+
+Here's what I did to get to the following information:
+
+cp cpup4.c cpup5.c
+vi cpup5.c
+143G
+:s/(\*xptr)/printf/
+:wq
+/opt/SUNWspro/bin/cc -g -o cpup5 cpup5.c
+/usr/ccs/bin/dis -F copyup cpup5
+
+The call to printf() ends up looking like this in the disassembly:
+10ec8:  40 00 41 36        call         printf
+
+So, C statement printf("function at %p got to %d'th copy\n", yptr, i);
+ends up compiling to a 32-bit instruction at addres 0x10ec8 for me:
+
+ 3         2         1         0
+10987654321098765432109876543210
+01000000000000000100000100110110
+op--------disp30----------------
+
+op: 01
+disp30: 100000100110110 = 0x4136
+
+The call instruction branches relative to current program counter:
+
+CALL  pc + 4 * 16694 = 0x10ec8 + 4 * 0x4136 = 0x213A0
+
+This "call" sets pc to  0x213A0, in my compiled version according to
+/usr/ccs/bin/elfdump, is printf() (/usr/ccs/bin/elfdump -s cpup5)
+According to /usr/ccs/bin/elfdump -c, the ".plt" section of the ELF
+file in question gets loaded into address 0x21340.
+
+You can disassemble the .plt (program linkage table) section:
+/usr/ccs/bin/dis -t .plt cpup5, and you get this in the section
+in question:
+
+        213a0:  03 00 00 60        sethi        %hi(0x18000), %g1
+        213a4:  30 bf ff e7        ba,a         _PROCEDURE_LINKAGE_TABLE_
+        213a8:  01 00 00 00        nop
+
+This means that the actual SPARC instructions in compiled function
+copyup() causes a branch to the .plt section, which causes a "ba,a"
+(branch always, annul delay slot instruction) to somewhere else.
+I think this "somewhere else" gets set at process startup time,
+during dynamic linking.  Note the lack of stack frame setup
+(no "save" instruction) in this little code fragment.  I don't understand
+the sethi instruction.
+
+When the .text section (linked SPARC instructions) for copyup()
+get copied into some malloc()'ed memory, the "0x40004136" instruction
+doesn't branch to the .plt section.  It branches to somewhere else
+in the process's memory space, which doesn't contain executable
+code, and so segfaults.
+
+In the original, passed-by-address version of cpup4.c, the call
+to printf() gets done by pointer dereference:
+
+	(*xptr)("function at %p got to %d'th copy\n", yptr, i);
+
+This C statement ends up call printf() through a sequence
+of instructions going something like this:
+
+  Address         Instruction       Decoded
+0x00010e80        0x9de3bf88        save %sp, -120, %sp ! function copyup
+0x00010e84        0xfa27a058        st %i5, [%fp + 88]
+0x00010e88        0xf827a054        st %i4, [%fp + 84]
+0x00010e8c        0xf627a050        st %i3, [%fp + 80]
+0x00010e90        0xf427a04c        st %i2, [%fp + 76] !note [1]
+0x00010e94        0xf227a048        st %i1, [%fp + 72]
+0x00010e98        0xf027a044        st %i0, [%fp + 68]
+	...
+0x00010eb0        0xe607a04c        ld [%fp + 76], %l3  !note [3]
+	...
+0x00010ed0        0x9fc4c000        jmpl %l3 + %g0, %o7  !note [4]
+0x00010ed4        0x01000000        nop                  !note [5]
+
+C function copyup() has 8 formal arguments, arg 3 has the value
+of the address of printf().
+
+Note 1: this instruction stores the address of printf at an
+offset of 76 bytes from the frame pointer, since %i2 contains
+the value of the 3rd formal argument.
+
+Note 2: I think that arguments 7 and 8 get passed on the stack
+so no code gets generated to store register values on the stack
+for args 7 and 8.
+
+Note 3: This loads the address of printf from off the stack
+into %l3
+
+Note 4: Here's the "jump and link" instruction that branches
+to the address in %l3 (printf) and puts the address of
+the jmpl into %o7 (%o7 used by convention).  In the called
+function, to return to the caller, an instruction like this:
+	ret        ; jmpl %i7+8, %g0
+gets called.  %o7 in the caller is the same register as %i7
+in the called function.
+
+Heap-located copies of copyup() keep passing 0x21A30 to the
+next copy, so the jmpl instructions in the copies branch to
+0x21A30 absolutely (in the .plt section) to print out stuff.
+jmpl doesn't do any relative-to-program-counter arithmetic
+to determine the actual branched-to-location.
+
+Note 5: No-op instruction in delay slot of jmpl instruction.
+The mysteries of SPARC instruction set, I guess.
