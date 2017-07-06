@@ -27,3 +27,6 @@ an M68010, SPARC, Mips R2000, R3000, R4000, and many others. It
 probably won't work on M68040 or Alpha CPUs without in-line
 assembly code to flush those CPU's instruction caches.
 
+It will probably never work on Hewlett-Packard's ghastly HP-PA CPU
+because of that architecture's poorly-documented segmentation. But
+HP-PA has shuffled off this mortal coil, so it really doesn't matter.
